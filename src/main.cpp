@@ -43,7 +43,7 @@
 
 // 검출은 절대온도 threshold
 #define USE_FIXED_DETECT_TEMP   1
-#define DETECT_TEMP_FIXED       29.5f
+#define DETECT_TEMP_FIXED       28.5f
 
 // fallback용
 #define THRESH_RATIO            0.55f
@@ -57,6 +57,13 @@
 #define MORPH_KERNEL_RADIUS     1
 #define DO_OPENING              0
 #define DO_CLOSING              1
+
+// 열원 기준 torso 확장
+#define ENABLE_HOT_TORSO_EXPAND     1
+#define HOT_EXPAND_TEMP_MARGIN      1.8f   // hottest 보다 이만큼 낮은 온도까지 허용
+#define HOT_EXPAND_MIN_TEMP         27.0f  // torso 후보 최소 온도
+#define HOT_EXPAND_DOWN_CELLS       10     // 얼굴 아래로 최대 확장 셀 수
+#define HOT_EXPAND_SIDE_CELLS       5      // 좌우 최대 확장 셀 수
 
 #define LOOP_DELAY_MS           5
 
@@ -115,7 +122,23 @@ typedef struct {
   int cy;
   int hx;
   int hy;
+  uint16_t boxColor;
 } OverlayScreen;
+
+typedef enum {
+  BODY_UNKNOWN = 0,
+  BODY_UPPER,
+  BODY_FULL
+} BodyType;
+
+typedef struct {
+  BodyType type;
+  float aspect;
+  float bottomRatio;
+  float hotTopRatio;
+  int bw;
+  int bh;
+} BodyClassResult;
 
 // =====================================================
 // 유틸
@@ -140,33 +163,31 @@ uint16_t colorMap565(uint8_t v) {
   uint8_t r = 0, g = 0, b = 0;
 
   if (v < 64) {
-    r = 0;
-    g = v * 4;
-    b = 255;
+    r = 0; g = v * 4; b = 255;
   } else if (v < 128) {
-    r = 0;
-    g = 255;
-    b = 255 - (v - 64) * 4;
+    r = 0; g = 255; b = 255 - (v - 64) * 4;
   } else if (v < 192) {
-    r = (v - 128) * 4;
-    g = 255;
-    b = 0;
+    r = (v - 128) * 4; g = 255; b = 0;
   } else {
-    r = 255;
-    g = 255 - (v - 192) * 4;
-    b = 0;
+    r = 255; g = 255 - (v - 192) * 4; b = 0;
   }
 
   return rgb565(r, g, b);
+}
+
+const char* bodyTypeToString(BodyType t) {
+  switch (t) {
+    case BODY_UPPER: return "UPPER";
+    case BODY_FULL:  return "FULL";
+    default:         return "UNKNOWN";
+  }
 }
 
 // =====================================================
 // MLX90640 읽기
 // =====================================================
 bool readMLXFrame(float out[SRC_H][SRC_W]) {
-  if (mlx.getFrame(mlxRaw) != 0) {
-    return false;
-  }
+  if (mlx.getFrame(mlxRaw) != 0) return false;
 
   for (int y = 0; y < SRC_H; y++) {
     for (int x = 0; x < SRC_W; x++) {
@@ -197,8 +218,7 @@ void applyEMA(float frame[SRC_H][SRC_W], bool firstFrame) {
 // adaptive range
 // =====================================================
 void estimateAdaptiveRange(float &tMin, float &tMax) {
-  float sum = 0.0f;
-  float sum2 = 0.0f;
+  float sum = 0.0f, sum2 = 0.0f;
   const int n = SRC_W * SRC_H;
 
   for (int y = 0; y < SRC_H; y++) {
@@ -250,18 +270,10 @@ void calcDisplayWindow(int &drawX, int &drawY, int &drawW, int &drawH) {
 }
 
 void clearMargins(int drawX, int drawY, int drawW, int drawH) {
-  if (drawY > 0) {
-    tft.fillRectangle(0, 0, TFT_W - 1, drawY - 1, COLOR_BLACK);
-  }
-  if (drawY + drawH < TFT_H) {
-    tft.fillRectangle(0, drawY + drawH, TFT_W - 1, TFT_H - 1, COLOR_BLACK);
-  }
-  if (drawX > 0) {
-    tft.fillRectangle(0, drawY, drawX - 1, drawY + drawH - 1, COLOR_BLACK);
-  }
-  if (drawX + drawW < TFT_W) {
-    tft.fillRectangle(drawX + drawW, drawY, TFT_W - 1, drawY + drawH - 1, COLOR_BLACK);
-  }
+  if (drawY > 0) tft.fillRectangle(0, 0, TFT_W - 1, drawY - 1, COLOR_BLACK);
+  if (drawY + drawH < TFT_H) tft.fillRectangle(0, drawY + drawH, TFT_W - 1, TFT_H - 1, COLOR_BLACK);
+  if (drawX > 0) tft.fillRectangle(0, drawY, drawX - 1, drawY + drawH - 1, COLOR_BLACK);
+  if (drawX + drawW < TFT_W) tft.fillRectangle(drawX + drawW, drawY, TFT_W - 1, drawY + drawH - 1, COLOR_BLACK);
 }
 
 // =====================================================
@@ -269,7 +281,6 @@ void clearMargins(int drawX, int drawY, int drawW, int drawH) {
 // =====================================================
 float buildThresholdMask(float tMin, float tMax) {
   float thresholdTemp;
-
 #if USE_FIXED_DETECT_TEMP
   thresholdTemp = DETECT_TEMP_FIXED;
 #else
@@ -293,18 +304,15 @@ void erodeMask(const uint8_t src[SRC_H][SRC_W], uint8_t dst[SRC_H][SRC_W], int r
   for (int y = 0; y < SRC_H; y++) {
     for (int x = 0; x < SRC_W; x++) {
       uint8_t keep = 1;
-
       for (int ky = -radius; ky <= radius && keep; ky++) {
         for (int kx = -radius; kx <= radius; kx++) {
-          int nx = x + kx;
-          int ny = y + ky;
+          int nx = x + kx, ny = y + ky;
           if (nx < 0 || nx >= SRC_W || ny < 0 || ny >= SRC_H || src[ny][nx] == 0) {
             keep = 0;
             break;
           }
         }
       }
-
       dst[y][x] = keep;
     }
   }
@@ -314,11 +322,9 @@ void dilateMask(const uint8_t src[SRC_H][SRC_W], uint8_t dst[SRC_H][SRC_W], int 
   for (int y = 0; y < SRC_H; y++) {
     for (int x = 0; x < SRC_W; x++) {
       uint8_t on = 0;
-
       for (int ky = -radius; ky <= radius && !on; ky++) {
         for (int kx = -radius; kx <= radius; kx++) {
-          int nx = x + kx;
-          int ny = y + ky;
+          int nx = x + kx, ny = y + ky;
           if (nx < 0 || nx >= SRC_W || ny < 0 || ny >= SRC_H) continue;
           if (src[ny][nx]) {
             on = 1;
@@ -326,7 +332,6 @@ void dilateMask(const uint8_t src[SRC_H][SRC_W], uint8_t dst[SRC_H][SRC_W], int 
           }
         }
       }
-
       dst[y][x] = on;
     }
   }
@@ -340,6 +345,8 @@ void applyMorphology() {
   #endif
 
   #if DO_CLOSING
+    dilateMask(maskFrame, morphTemp, MORPH_KERNEL_RADIUS);
+    erodeMask(morphTemp, maskFrame, MORPH_KERNEL_RADIUS);
     dilateMask(maskFrame, morphTemp, MORPH_KERNEL_RADIUS);
     erodeMask(morphTemp, maskFrame, MORPH_KERNEL_RADIUS);
   #endif
@@ -366,12 +373,9 @@ DetectionResult floodFillBlob(int startX, int startY, float thresholdTemp, float
   r.tMin = tMin;
   r.tMax = tMax;
 
-  long sumX = 0;
-  long sumY = 0;
+  long sumX = 0, sumY = 0;
 
-  int head = 0;
-  int tail = 0;
-
+  int head = 0, tail = 0;
   queueX[tail] = startX;
   queueY[tail] = startY;
   tail++;
@@ -383,7 +387,6 @@ DetectionResult floodFillBlob(int startX, int startY, float thresholdTemp, float
     head++;
 
     float temp = smoothFrame[y][x];
-
     r.count++;
     sumX += x;
     sumY += y;
@@ -412,7 +415,6 @@ DetectionResult floodFillBlob(int startX, int startY, float thresholdTemp, float
     for (int i = 0; i < nNbr; i++) {
       int nx = x + dxs[i];
       int ny = y + dys[i];
-
       if (nx < 0 || nx >= SRC_W || ny < 0 || ny >= SRC_H) continue;
       if (visited[ny][nx]) continue;
       if (!maskFrame[ny][nx]) continue;
@@ -468,13 +470,137 @@ DetectionResult detectLargestBlob(float tMin, float tMax) {
       if (visited[y][x]) continue;
 
       DetectionResult blob = floodFillBlob(x, y, thresholdTemp, tMin, tMax);
-      if (blob.valid && blob.count > best.count) {
-        best = blob;
-      }
+      if (blob.valid && blob.count > best.count) best = blob;
     }
   }
 
   return best;
+}
+
+// =====================================================
+// 얼굴만 잡힐 때 상체 박스로 1차 확장
+// =====================================================
+void expandBoxForUpperBody(DetectionResult &r) {
+  if (!r.valid) return;
+
+  int bw = r.maxX - r.minX + 1;
+  int bh = r.maxY - r.minY + 1;
+  if (bw <= 0) bw = 1;
+
+  if (bh <= 6 || ((float)bh / (float)bw < 0.9f)) {
+    int extraDown = bh * 2 + 4;
+    int extraSide = bw / 2 + 1;
+    int extraUp   = 1;
+
+    r.minX = clampi(r.minX - extraSide, 0, SRC_W - 1);
+    r.maxX = clampi(r.maxX + extraSide, 0, SRC_W - 1);
+    r.minY = clampi(r.minY - extraUp,   0, SRC_H - 1);
+    r.maxY = clampi(r.maxY + extraDown, 0, SRC_H - 1);
+
+    r.cx = 0.5f * (r.minX + r.maxX);
+    r.cy = 0.5f * (r.minY + r.maxY);
+  }
+}
+
+// =====================================================
+// 열원(얼굴) 기준 torso 추가 확장
+// hottest point 아래쪽 warm region을 찾아 박스 확장
+// =====================================================
+void expandTorsoFromHotRegion(DetectionResult &r) {
+#if ENABLE_HOT_TORSO_EXPAND
+  if (!r.valid) return;
+
+  float torsoTempThr = r.hotTemp - HOT_EXPAND_TEMP_MARGIN;
+  if (torsoTempThr < HOT_EXPAND_MIN_TEMP) {
+    torsoTempThr = HOT_EXPAND_MIN_TEMP;
+  }
+
+  int xStart = clampi(r.hotX - HOT_EXPAND_SIDE_CELLS, 0, SRC_W - 1);
+  int xEnd   = clampi(r.hotX + HOT_EXPAND_SIDE_CELLS, 0, SRC_W - 1);
+  int yStart = clampi(r.hotY, 0, SRC_H - 1);
+  int yEnd   = clampi(r.hotY + HOT_EXPAND_DOWN_CELLS, 0, SRC_H - 1);
+
+  int addMinX = SRC_W - 1;
+  int addMinY = SRC_H - 1;
+  int addMaxX = 0;
+  int addMaxY = 0;
+  int addCount = 0;
+  long sumX = 0;
+  long sumY = 0;
+
+  for (int y = yStart; y <= yEnd; y++) {
+    for (int x = xStart; x <= xEnd; x++) {
+      float temp = smoothFrame[y][x];
+      if (temp >= torsoTempThr) {
+        addCount++;
+        sumX += x;
+        sumY += y;
+        if (x < addMinX) addMinX = x;
+        if (y < addMinY) addMinY = y;
+        if (x > addMaxX) addMaxX = x;
+        if (y > addMaxY) addMaxY = y;
+      }
+    }
+  }
+
+  if (addCount >= 4) {
+    if (addMinX < r.minX) r.minX = addMinX;
+    if (addMinY < r.minY) r.minY = addMinY;
+    if (addMaxX > r.maxX) r.maxX = addMaxX;
+    if (addMaxY > r.maxY) r.maxY = addMaxY;
+
+    // 중심은 기존 box 중심보다 torso 쪽을 조금 반영
+    float torsoCx = (float)sumX / (float)addCount;
+    float torsoCy = (float)sumY / (float)addCount;
+    r.cx = 0.35f * r.cx + 0.65f * torsoCx;
+    r.cy = 0.30f * r.cy + 0.70f * torsoCy;
+  }
+#endif
+}
+
+// =====================================================
+// 상체 / 전신 분류
+// =====================================================
+BodyClassResult classifyBodyType(const DetectionResult &r) {
+  BodyClassResult c;
+  c.type = BODY_UNKNOWN;
+  c.aspect = 0.0f;
+  c.bottomRatio = 0.0f;
+  c.hotTopRatio = 0.0f;
+  c.bw = 0;
+  c.bh = 0;
+
+  if (!r.valid) return c;
+
+  c.bw = r.maxX - r.minX + 1;
+  c.bh = r.maxY - r.minY + 1;
+  if (c.bw <= 0) c.bw = 1;
+  if (c.bh <= 0) c.bh = 1;
+
+  c.aspect = (float)c.bh / (float)c.bw;
+  c.bottomRatio = (float)r.maxY / (float)(SRC_H - 1);
+  c.hotTopRatio = (float)r.hotY / (float)(SRC_H - 1);
+
+  // 전신: 세로로 길고, 하단이 충분히 내려옴
+  if (c.aspect >= 1.20f && c.bottomRatio >= 0.88f) {
+    c.type = BODY_FULL;
+    return c;
+  }
+
+  // 상체: 하단이 충분히 안 내려오거나 세로/가로 비가 낮음
+  if (c.aspect < 1.20f || c.bottomRatio < 0.84f) {
+    c.type = BODY_UPPER;
+    return c;
+  }
+
+  // 열원이 상단에 몰리고 하단이 끝까지 안 가면 상체
+  if (c.hotTopRatio < 0.45f && c.bottomRatio < 0.90f) {
+    c.type = BODY_UPPER;
+    return c;
+  }
+
+  c.type = BODY_UNKNOWN;
+  return c;
 }
 
 // =====================================================
@@ -492,11 +618,12 @@ int mapSrcYToScreen(float srcY) {
   return drawY + (int)((srcY / (SRC_H - 1)) * (drawH - 1) + 0.5f);
 }
 
-OverlayScreen makeOverlayScreen(const DetectionResult &r) {
+OverlayScreen makeOverlayScreen(const DetectionResult &r, const BodyClassResult &cls) {
   OverlayScreen o;
   o.valid = false;
   o.boxX0 = o.boxY0 = o.boxX1 = o.boxY1 = 0;
   o.cx = o.cy = o.hx = o.hy = 0;
+  o.boxColor = COLOR_WHITE;
 
   if (!r.valid) return o;
 
@@ -510,6 +637,10 @@ OverlayScreen makeOverlayScreen(const DetectionResult &r) {
   o.hx    = mapSrcXToScreen(r.hotX);
   o.hy    = mapSrcYToScreen(r.hotY);
 
+  if (cls.type == BODY_UPPER) o.boxColor = COLOR_YELLOW;
+  else if (cls.type == BODY_FULL) o.boxColor = COLOR_GREEN;
+  else o.boxColor = COLOR_WHITE;
+
   return o;
 }
 
@@ -519,9 +650,7 @@ OverlayScreen makeOverlayScreen(const DetectionResult &r) {
 void applyOverlayToLine(uint16_t *buf, int screenY, int width, const OverlayScreen &o) {
   if (!o.valid) return;
 
-  // -------------------------
   // 1) bounding box
-  // -------------------------
   if (screenY == o.boxY0 || screenY == o.boxY1) {
     int x0 = clampi(o.boxX0, 0, width - 1);
     int x1 = clampi(o.boxX1, 0, width - 1);
@@ -529,20 +658,18 @@ void applyOverlayToLine(uint16_t *buf, int screenY, int width, const OverlayScre
       int t = x0; x0 = x1; x1 = t;
     }
     for (int x = x0; x <= x1; x++) {
-      buf[x] = COLOR_YELLOW;
+      buf[x] = o.boxColor;
     }
   }
 
   if (screenY >= o.boxY0 && screenY <= o.boxY1) {
-    if (o.boxX0 >= 0 && o.boxX0 < width) buf[o.boxX0] = COLOR_YELLOW;
-    if (o.boxX1 >= 0 && o.boxX1 < width) buf[o.boxX1] = COLOR_YELLOW;
-    if (o.boxX0 + 1 >= 0 && o.boxX0 + 1 < width) buf[o.boxX0 + 1] = COLOR_YELLOW;
-    if (o.boxX1 - 1 >= 0 && o.boxX1 - 1 < width) buf[o.boxX1 - 1] = COLOR_YELLOW;
+    if (o.boxX0 >= 0 && o.boxX0 < width) buf[o.boxX0] = o.boxColor;
+    if (o.boxX1 >= 0 && o.boxX1 < width) buf[o.boxX1] = o.boxColor;
+    if (o.boxX0 + 1 >= 0 && o.boxX0 + 1 < width) buf[o.boxX0 + 1] = o.boxColor;
+    if (o.boxX1 - 1 >= 0 && o.boxX1 - 1 < width) buf[o.boxX1 - 1] = o.boxColor;
   }
 
-  // -------------------------
-  // 2) centroid cross
-  // -------------------------
+  // 2) center
   if (screenY == o.cy || screenY == o.cy - 1 || screenY == o.cy + 1) {
     for (int dx = -6; dx <= 6; dx++) {
       int x = o.cx + dx;
@@ -556,9 +683,7 @@ void applyOverlayToLine(uint16_t *buf, int screenY, int width, const OverlayScre
     if (o.cx + 1 >= 0 && o.cx + 1 < width) buf[o.cx + 1] = COLOR_GREEN;
   }
 
-  // -------------------------
-  // 3) hottest point X
-  // -------------------------
+  // 3) hot point
   for (int dx = -5; dx <= 5; dx++) {
     int x1 = o.hx + dx;
     int y1 = o.hy + dx;
@@ -584,12 +709,12 @@ void applyOverlayToLine(uint16_t *buf, int screenY, int width, const OverlayScre
 // =====================================================
 // heatmap + overlay 스트리밍 출력
 // =====================================================
-void drawHeatmapStreamingWithOverlay(float tMin, float tMax, const DetectionResult &det) {
+void drawHeatmapStreamingWithOverlay(float tMin, float tMax, const DetectionResult &det, const BodyClassResult &cls) {
   int drawX, drawY, drawW, drawH;
   calcDisplayWindow(drawX, drawY, drawW, drawH);
   clearMargins(drawX, drawY, drawW, drawH);
 
-  OverlayScreen ov = makeOverlayScreen(det);
+  OverlayScreen ov = makeOverlayScreen(det, cls);
 
   for (int dy = 0; dy < drawH; dy++) {
     int screenY = drawY + dy;
@@ -616,7 +741,6 @@ void drawHeatmapStreamingWithOverlay(float tMin, float tMax, const DetectionResu
 
       float n = (temp - tMin) / (tMax - tMin);
       n = clampf(n, 0.0f, 1.0f);
-
       lineBuf[dx] = colorMap565((uint8_t)(n * 255.0f));
     }
 
@@ -630,7 +754,6 @@ void drawHeatmapStreamingWithOverlay(float tMin, float tMax, const DetectionResu
     }
 
     tft.drawBitmap(drawX, screenY, lineBuf, drawW, 1);
-
     if ((dy & 7) == 0) yield();
   }
 }
@@ -663,8 +786,22 @@ void printDetection(const DetectionResult &r) {
   } else {
     Serial.print(" | No valid blob");
   }
-
   Serial.println();
+}
+
+void printBodyClass(const BodyClassResult &c) {
+  Serial.print("BodyType=");
+  Serial.print(bodyTypeToString(c.type));
+  Serial.print(" | bw=");
+  Serial.print(c.bw);
+  Serial.print(" bh=");
+  Serial.print(c.bh);
+  Serial.print(" aspect=");
+  Serial.print(c.aspect, 2);
+  Serial.print(" bottom=");
+  Serial.print(c.bottomRatio, 2);
+  Serial.print(" hotTop=");
+  Serial.println(c.hotTopRatio, 2);
 }
 
 // =====================================================
@@ -696,7 +833,7 @@ void setup() {
   tft.setOrientation(3);
   tft.clear();
 
-  Serial.println("MLX90640 close upper-body overlay demo start");
+  Serial.println("MLX90640 upper/full body classified demo start");
 }
 
 // =====================================================
@@ -719,8 +856,20 @@ void loop() {
 #endif
 
     DetectionResult det = detectLargestBlob(tMin, tMax);
-    drawHeatmapStreamingWithOverlay(tMin, tMax, det);
+
+    // 1차: 얼굴만 잡히면 상체 box 확장
+    expandBoxForUpperBody(det);
+
+    // 2차: hottest point 아래 torso warm region 반영
+    expandTorsoFromHotRegion(det);
+
+    // 분류
+    BodyClassResult cls = classifyBodyType(det);
+
+    // 출력
+    drawHeatmapStreamingWithOverlay(tMin, tMax, det, cls);
     printDetection(det);
+    printBodyClass(cls);
   } else {
     Serial.println("MLX90640 frame read error");
   }
