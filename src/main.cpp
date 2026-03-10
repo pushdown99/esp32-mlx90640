@@ -7,12 +7,10 @@
 // =====================================================
 // 핀 설정
 // =====================================================
-// MLX90640 I2C
 #define I2C_SDA         21
 #define I2C_SCL         22
 #define I2C_FREQ        800000
 
-// ILI9225 SPI
 #define TFT_RST         26
 #define TFT_RS          25
 #define TFT_CS          15
@@ -56,12 +54,9 @@
 
 // morphology
 #define ENABLE_MORPHOLOGY       1
-#define MORPH_KERNEL_RADIUS     1   // 3x3
-#define DO_OPENING              0   // 상체가 깎이지 않게 끔
-#define DO_CLOSING              1   // 몸통 연결 강화
-
-// 선택 blob 격자 표시
-#define SHOW_BLOB_GRID          0
+#define MORPH_KERNEL_RADIUS     1
+#define DO_OPENING              0
+#define DO_CLOSING              1
 
 #define LOOP_DELAY_MS           5
 
@@ -82,13 +77,12 @@ static uint16_t lineBuf[TFT_W];
 static uint8_t maskFrame[SRC_H][SRC_W];
 static uint8_t morphTemp[SRC_H][SRC_W];
 static uint8_t visited[SRC_H][SRC_W];
-static uint8_t selectedBlob[SRC_H][SRC_W];
 
 static int queueX[SRC_W * SRC_H];
 static int queueY[SRC_W * SRC_H];
 
 // =====================================================
-// 검출 결과 구조체
+// 구조체
 // =====================================================
 typedef struct {
   bool valid;
@@ -111,6 +105,18 @@ typedef struct {
   float tMax;
 } DetectionResult;
 
+typedef struct {
+  bool valid;
+  int boxX0;
+  int boxY0;
+  int boxX1;
+  int boxY1;
+  int cx;
+  int cy;
+  int hx;
+  int hy;
+} OverlayScreen;
+
 // =====================================================
 // 유틸
 // =====================================================
@@ -130,7 +136,6 @@ static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
   return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
 }
 
-// blue -> cyan -> green -> yellow -> red
 uint16_t colorMap565(uint8_t v) {
   uint8_t r = 0, g = 0, b = 0;
 
@@ -181,8 +186,8 @@ void applyEMA(float frame[SRC_H][SRC_W], bool firstFrame) {
         smoothFrame[y][x] = frame[y][x];
       } else {
         smoothFrame[y][x] =
-            EMA_ALPHA * frame[y][x] +
-            (1.0f - EMA_ALPHA) * smoothFrame[y][x];
+          EMA_ALPHA * frame[y][x] +
+          (1.0f - EMA_ALPHA) * smoothFrame[y][x];
       }
     }
   }
@@ -260,47 +265,6 @@ void clearMargins(int drawX, int drawY, int drawW, int drawH) {
 }
 
 // =====================================================
-// heatmap 스트리밍 출력
-// =====================================================
-void drawHeatmapStreaming(float tMin, float tMax) {
-  int drawX, drawY, drawW, drawH;
-  calcDisplayWindow(drawX, drawY, drawW, drawH);
-  clearMargins(drawX, drawY, drawW, drawH);
-
-  for (int dy = 0; dy < drawH; dy++) {
-    float sy = ((float)dy * (SRC_H - 1)) / (drawH - 1);
-    int y0 = (int)sy;
-    int y1 = clampi(y0 + 1, 0, SRC_H - 1);
-    float fy = sy - y0;
-
-    for (int dx = 0; dx < drawW; dx++) {
-      float sx = ((float)dx * (SRC_W - 1)) / (drawW - 1);
-      int x0 = (int)sx;
-      int x1 = clampi(x0 + 1, 0, SRC_W - 1);
-      float fx = sx - x0;
-
-      float p00 = smoothFrame[y0][x0];
-      float p10 = smoothFrame[y0][x1];
-      float p01 = smoothFrame[y1][x0];
-      float p11 = smoothFrame[y1][x1];
-
-      float top = p00 + (p10 - p00) * fx;
-      float bot = p01 + (p11 - p01) * fx;
-      float temp = top + (bot - top) * fy;
-
-      float n = (temp - tMin) / (tMax - tMin);
-      n = clampf(n, 0.0f, 1.0f);
-
-      lineBuf[dx] = colorMap565((uint8_t)(n * 255.0f));
-    }
-
-    tft.drawBitmap(drawX, drawY + dy, lineBuf, drawW, 1);
-
-    if ((dy & 7) == 0) yield();
-  }
-}
-
-// =====================================================
 // threshold mask 생성
 // =====================================================
 float buildThresholdMask(float tMin, float tMax) {
@@ -316,7 +280,6 @@ float buildThresholdMask(float tMin, float tMax) {
     for (int x = 0; x < SRC_W; x++) {
       maskFrame[y][x] = (smoothFrame[y][x] >= thresholdTemp) ? 1 : 0;
       visited[y][x] = 0;
-      selectedBlob[y][x] = 0;
     }
   }
 
@@ -335,7 +298,6 @@ void erodeMask(const uint8_t src[SRC_H][SRC_W], uint8_t dst[SRC_H][SRC_W], int r
         for (int kx = -radius; kx <= radius; kx++) {
           int nx = x + kx;
           int ny = y + ky;
-
           if (nx < 0 || nx >= SRC_W || ny < 0 || ny >= SRC_H || src[ny][nx] == 0) {
             keep = 0;
             break;
@@ -357,7 +319,6 @@ void dilateMask(const uint8_t src[SRC_H][SRC_W], uint8_t dst[SRC_H][SRC_W], int 
         for (int kx = -radius; kx <= radius; kx++) {
           int nx = x + kx;
           int ny = y + ky;
-
           if (nx < 0 || nx >= SRC_W || ny < 0 || ny >= SRC_H) continue;
           if (src[ny][nx]) {
             on = 1;
@@ -386,7 +347,7 @@ void applyMorphology() {
 }
 
 // =====================================================
-// 한 개 blob flood fill
+// flood fill
 // =====================================================
 DetectionResult floodFillBlob(int startX, int startY, float thresholdTemp, float tMin, float tMax) {
   DetectionResult r;
@@ -414,7 +375,6 @@ DetectionResult floodFillBlob(int startX, int startY, float thresholdTemp, float
   queueX[tail] = startX;
   queueY[tail] = startY;
   tail++;
-
   visited[startY][startX] = 1;
 
   while (head < tail) {
@@ -483,7 +443,6 @@ DetectionResult detectLargestBlob(float tMin, float tMax) {
   for (int y = 0; y < SRC_H; y++) {
     for (int x = 0; x < SRC_W; x++) {
       visited[y][x] = 0;
-      selectedBlob[y][x] = 0;
     }
   }
 
@@ -503,68 +462,14 @@ DetectionResult detectLargestBlob(float tMin, float tMax) {
   best.tMin = tMin;
   best.tMax = tMax;
 
-  int bestSeedX = -1;
-  int bestSeedY = -1;
-
   for (int y = 0; y < SRC_H; y++) {
     for (int x = 0; x < SRC_W; x++) {
       if (!maskFrame[y][x]) continue;
       if (visited[y][x]) continue;
 
       DetectionResult blob = floodFillBlob(x, y, thresholdTemp, tMin, tMax);
-
       if (blob.valid && blob.count > best.count) {
         best = blob;
-        bestSeedX = x;
-        bestSeedY = y;
-      }
-    }
-  }
-
-  if (best.valid && bestSeedX >= 0 && bestSeedY >= 0) {
-    for (int y = 0; y < SRC_H; y++) {
-      for (int x = 0; x < SRC_W; x++) {
-        visited[y][x] = 0;
-      }
-    }
-
-    int head = 0;
-    int tail = 0;
-    queueX[tail] = bestSeedX;
-    queueY[tail] = bestSeedY;
-    tail++;
-
-    visited[bestSeedY][bestSeedX] = 1;
-    selectedBlob[bestSeedY][bestSeedX] = 1;
-
-    while (head < tail) {
-      int x = queueX[head];
-      int y = queueY[head];
-      head++;
-
-#if USE_8_CONNECTED
-      const int dxs[8] = {-1, 0, 1, -1, 1, -1, 0, 1};
-      const int dys[8] = {-1,-1,-1,  0, 0,  1, 1, 1};
-      const int nNbr = 8;
-#else
-      const int dxs[4] = {-1, 1, 0, 0};
-      const int dys[4] = { 0, 0,-1, 1};
-      const int nNbr = 4;
-#endif
-
-      for (int i = 0; i < nNbr; i++) {
-        int nx = x + dxs[i];
-        int ny = y + dys[i];
-
-        if (nx < 0 || nx >= SRC_W || ny < 0 || ny >= SRC_H) continue;
-        if (visited[ny][nx]) continue;
-        if (!maskFrame[ny][nx]) continue;
-
-        visited[ny][nx] = 1;
-        selectedBlob[ny][nx] = 1;
-        queueX[tail] = nx;
-        queueY[tail] = ny;
-        tail++;
       }
     }
   }
@@ -573,7 +478,7 @@ DetectionResult detectLargestBlob(float tMin, float tMax) {
 }
 
 // =====================================================
-// 소스 좌표 -> 화면 좌표
+// 좌표 변환
 // =====================================================
 int mapSrcXToScreen(float srcX) {
   int drawX, drawY, drawW, drawH;
@@ -587,82 +492,147 @@ int mapSrcYToScreen(float srcY) {
   return drawY + (int)((srcY / (SRC_H - 1)) * (drawH - 1) + 0.5f);
 }
 
-// =====================================================
-// 안전한 박스 그리기
-// =====================================================
-void drawBoxSafe(int x0, int y0, int x1, int y1, uint16_t color) {
-  x0 = clampi(x0, 0, TFT_W - 1);
-  x1 = clampi(x1, 0, TFT_W - 1);
-  y0 = clampi(y0, 0, TFT_H - 1);
-  y1 = clampi(y1, 0, TFT_H - 1);
+OverlayScreen makeOverlayScreen(const DetectionResult &r) {
+  OverlayScreen o;
+  o.valid = false;
+  o.boxX0 = o.boxY0 = o.boxX1 = o.boxY1 = 0;
+  o.cx = o.cy = o.hx = o.hy = 0;
 
-  if (x1 < x0) {
-    int t = x0; x0 = x1; x1 = t;
-  }
-  if (y1 < y0) {
-    int t = y0; y0 = y1; y1 = t;
-  }
+  if (!r.valid) return o;
 
-  tft.drawLine(x0, y0, x1, y0, color);
-  tft.drawLine(x1, y0, x1, y1, color);
-  tft.drawLine(x1, y1, x0, y1, color);
-  tft.drawLine(x0, y1, x0, y0, color);
+  o.valid = true;
+  o.boxX0 = mapSrcXToScreen(r.minX);
+  o.boxY0 = mapSrcYToScreen(r.minY);
+  o.boxX1 = mapSrcXToScreen(r.maxX);
+  o.boxY1 = mapSrcYToScreen(r.maxY);
+  o.cx    = mapSrcXToScreen(r.cx);
+  o.cy    = mapSrcYToScreen(r.cy);
+  o.hx    = mapSrcXToScreen(r.hotX);
+  o.hy    = mapSrcYToScreen(r.hotY);
+
+  return o;
 }
 
 // =====================================================
-// overlay
+// lineBuf 위에 overlay 직접 그리기
 // =====================================================
-void drawSelectedBlobOverlay() {
-#if SHOW_BLOB_GRID
+void applyOverlayToLine(uint16_t *buf, int screenY, int width, const OverlayScreen &o) {
+  if (!o.valid) return;
+
+  // -------------------------
+  // 1) bounding box
+  // -------------------------
+  if (screenY == o.boxY0 || screenY == o.boxY1) {
+    int x0 = clampi(o.boxX0, 0, width - 1);
+    int x1 = clampi(o.boxX1, 0, width - 1);
+    if (x1 < x0) {
+      int t = x0; x0 = x1; x1 = t;
+    }
+    for (int x = x0; x <= x1; x++) {
+      buf[x] = COLOR_YELLOW;
+    }
+  }
+
+  if (screenY >= o.boxY0 && screenY <= o.boxY1) {
+    if (o.boxX0 >= 0 && o.boxX0 < width) buf[o.boxX0] = COLOR_YELLOW;
+    if (o.boxX1 >= 0 && o.boxX1 < width) buf[o.boxX1] = COLOR_YELLOW;
+    if (o.boxX0 + 1 >= 0 && o.boxX0 + 1 < width) buf[o.boxX0 + 1] = COLOR_YELLOW;
+    if (o.boxX1 - 1 >= 0 && o.boxX1 - 1 < width) buf[o.boxX1 - 1] = COLOR_YELLOW;
+  }
+
+  // -------------------------
+  // 2) centroid cross
+  // -------------------------
+  if (screenY == o.cy || screenY == o.cy - 1 || screenY == o.cy + 1) {
+    for (int dx = -6; dx <= 6; dx++) {
+      int x = o.cx + dx;
+      if (x >= 0 && x < width) buf[x] = COLOR_GREEN;
+    }
+  }
+
+  if (screenY >= o.cy - 6 && screenY <= o.cy + 6) {
+    if (o.cx >= 0 && o.cx < width) buf[o.cx] = COLOR_GREEN;
+    if (o.cx - 1 >= 0 && o.cx - 1 < width) buf[o.cx - 1] = COLOR_GREEN;
+    if (o.cx + 1 >= 0 && o.cx + 1 < width) buf[o.cx + 1] = COLOR_GREEN;
+  }
+
+  // -------------------------
+  // 3) hottest point X
+  // -------------------------
+  for (int dx = -5; dx <= 5; dx++) {
+    int x1 = o.hx + dx;
+    int y1 = o.hy + dx;
+    int x2 = o.hx + dx;
+    int y2 = o.hy - dx;
+
+    if (screenY == y1 && x1 >= 0 && x1 < width) buf[x1] = COLOR_RED;
+    if (screenY == y2 && x2 >= 0 && x2 < width) buf[x2] = COLOR_RED;
+  }
+
+  if (screenY == o.hy || screenY == o.hy - 1 || screenY == o.hy + 1) {
+    for (int dx = -4; dx <= 4; dx++) {
+      int x = o.hx + dx;
+      if (x >= 0 && x < width) buf[x] = COLOR_RED;
+    }
+  }
+
+  if (screenY >= o.hy - 4 && screenY <= o.hy + 4) {
+    if (o.hx >= 0 && o.hx < width) buf[o.hx] = COLOR_RED;
+  }
+}
+
+// =====================================================
+// heatmap + overlay 스트리밍 출력
+// =====================================================
+void drawHeatmapStreamingWithOverlay(float tMin, float tMax, const DetectionResult &det) {
   int drawX, drawY, drawW, drawH;
   calcDisplayWindow(drawX, drawY, drawW, drawH);
+  clearMargins(drawX, drawY, drawW, drawH);
 
-  for (int y = 0; y < SRC_H; y++) {
-    for (int x = 0; x < SRC_W; x++) {
-      if (selectedBlob[y][x]) {
-        int x0 = drawX + (x * drawW) / SRC_W;
-        int y0 = drawY + (y * drawH) / SRC_H;
-        int x1 = drawX + ((x + 1) * drawW) / SRC_W - 1;
-        int y1 = drawY + ((y + 1) * drawH) / SRC_H - 1;
-        drawBoxSafe(x0, y0, x1, y1, COLOR_WHITE);
-      }
+  OverlayScreen ov = makeOverlayScreen(det);
+
+  for (int dy = 0; dy < drawH; dy++) {
+    int screenY = drawY + dy;
+
+    float sy = ((float)dy * (SRC_H - 1)) / (drawH - 1);
+    int y0 = (int)sy;
+    int y1 = clampi(y0 + 1, 0, SRC_H - 1);
+    float fy = sy - y0;
+
+    for (int dx = 0; dx < drawW; dx++) {
+      float sx = ((float)dx * (SRC_W - 1)) / (drawW - 1);
+      int x0 = (int)sx;
+      int x1 = clampi(x0 + 1, 0, SRC_W - 1);
+      float fx = sx - x0;
+
+      float p00 = smoothFrame[y0][x0];
+      float p10 = smoothFrame[y0][x1];
+      float p01 = smoothFrame[y1][x0];
+      float p11 = smoothFrame[y1][x1];
+
+      float top = p00 + (p10 - p00) * fx;
+      float bot = p01 + (p11 - p01) * fx;
+      float temp = top + (bot - top) * fy;
+
+      float n = (temp - tMin) / (tMax - tMin);
+      n = clampf(n, 0.0f, 1.0f);
+
+      lineBuf[dx] = colorMap565((uint8_t)(n * 255.0f));
     }
 
-    if ((y & 3) == 0) yield();
+    if (ov.valid) {
+      OverlayScreen local = ov;
+      local.boxX0 -= drawX;
+      local.boxX1 -= drawX;
+      local.cx    -= drawX;
+      local.hx    -= drawX;
+      applyOverlayToLine(lineBuf, screenY, drawW, local);
+    }
+
+    tft.drawBitmap(drawX, screenY, lineBuf, drawW, 1);
+
+    if ((dy & 7) == 0) yield();
   }
-#endif
-}
-
-void drawDetectionOverlay(const DetectionResult &r) {
-  if (!r.valid) return;
-
-  int boxX0 = mapSrcXToScreen(r.minX);
-  int boxY0 = mapSrcYToScreen(r.minY);
-  int boxX1 = mapSrcXToScreen(r.maxX);
-  int boxY1 = mapSrcYToScreen(r.maxY);
-
-  int cx = mapSrcXToScreen(r.cx);
-  int cy = mapSrcYToScreen(r.cy);
-
-  int hx = mapSrcXToScreen(r.hotX);
-  int hy = mapSrcYToScreen(r.hotY);
-
-  // bounding box 강조
-  drawBoxSafe(boxX0, boxY0, boxX1, boxY1, COLOR_YELLOW);
-  drawBoxSafe(boxX0 + 1, boxY0 + 1, boxX1 - 1, boxY1 - 1, COLOR_YELLOW);
-
-  // centroid
-  tft.drawLine(cx - 6, cy, cx + 6, cy, COLOR_GREEN);
-  tft.drawLine(cx, cy - 6, cx, cy + 6, COLOR_GREEN);
-  tft.drawCircle(cx, cy, 3, COLOR_GREEN);
-  tft.drawCircle(cx, cy, 5, COLOR_GREEN);
-
-  // hottest area
-  tft.drawCircle(hx, hy, 3, COLOR_RED);
-  tft.drawCircle(hx, hy, 6, COLOR_RED);
-  tft.drawCircle(hx, hy, 9, COLOR_RED);
-  tft.drawLine(hx - 4, hy - 4, hx + 4, hy + 4, COLOR_RED);
-  tft.drawLine(hx - 4, hy + 4, hx + 4, hy - 4, COLOR_RED);
 }
 
 // =====================================================
@@ -704,15 +674,12 @@ void setup() {
   Serial.begin(115200);
   delay(300);
 
-  // 백라이트 수동 ON
   pinMode(TFT_LED, OUTPUT);
   digitalWrite(TFT_LED, HIGH);
 
-  // I2C
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(I2C_FREQ);
 
-  // MLX90640
   if (!mlx.begin(0x33, &Wire)) {
     Serial.println("MLX90640 init failed");
     while (1) delay(1000);
@@ -722,16 +689,14 @@ void setup() {
   mlx.setResolution(MLX90640_ADC_18BIT);
   mlx.setRefreshRate(MLX_REFRESH_RATE);
 
-  // SPI
   hspi.begin(TFT_SCK, -1, TFT_MOSI, TFT_CS);
 
-  // TFT
   tft.begin(hspi);
   tft.setDisplay(true);
   tft.setOrientation(3);
   tft.clear();
 
-  Serial.println("MLX90640 close upper-body demo start");
+  Serial.println("MLX90640 close upper-body overlay demo start");
 }
 
 // =====================================================
@@ -753,22 +718,12 @@ void loop() {
     tMax = TEMP_MAX_FIXED;
 #endif
 
-    // 1) heatmap
-    drawHeatmapStreaming(tMin, tMax);
-
-    // 2) detect
     DetectionResult det = detectLargestBlob(tMin, tMax);
-
-    // 3) overlay
-    drawSelectedBlobOverlay();
-    drawDetectionOverlay(det);
-
-    // 4) serial debug
+    drawHeatmapStreamingWithOverlay(tMin, tMax, det);
     printDetection(det);
   } else {
     Serial.println("MLX90640 frame read error");
   }
-  drawBoxSafe(20, 20, 120, 120, COLOR_WHITE);
 
   delay(LOOP_DELAY_MS);
 }
