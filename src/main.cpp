@@ -33,7 +33,7 @@
 // =====================================================
 #define EMA_ALPHA               0.35f
 
-// heatmap은 고정 온도 범위
+// heatmap 범위
 #define USE_ADAPTIVE_RANGE      0
 #define TEMP_MIN_FIXED          25.0f
 #define TEMP_MAX_FIXED          35.0f
@@ -41,11 +41,9 @@
 #define MLX_REFRESH_RATE        MLX90640_8_HZ
 #define KEEP_ASPECT_RATIO       1
 
-// 검출은 절대온도 threshold
+// 검출 threshold
 #define USE_FIXED_DETECT_TEMP   1
 #define DETECT_TEMP_FIXED       28.5f
-
-// fallback용
 #define THRESH_RATIO            0.55f
 
 // blob 조건
@@ -60,10 +58,10 @@
 
 // 열원 기준 torso 확장
 #define ENABLE_HOT_TORSO_EXPAND     1
-#define HOT_EXPAND_TEMP_MARGIN      1.8f   // hottest 보다 이만큼 낮은 온도까지 허용
-#define HOT_EXPAND_MIN_TEMP         27.0f  // torso 후보 최소 온도
-#define HOT_EXPAND_DOWN_CELLS       10     // 얼굴 아래로 최대 확장 셀 수
-#define HOT_EXPAND_SIDE_CELLS       5      // 좌우 최대 확장 셀 수
+#define HOT_EXPAND_TEMP_MARGIN      1.8f
+#define HOT_EXPAND_MIN_TEMP         27.0f
+#define HOT_EXPAND_DOWN_CELLS       10
+#define HOT_EXPAND_SIDE_CELLS       5
 
 #define LOOP_DELAY_MS           5
 
@@ -112,19 +110,6 @@ typedef struct {
   float tMax;
 } DetectionResult;
 
-typedef struct {
-  bool valid;
-  int boxX0;
-  int boxY0;
-  int boxX1;
-  int boxY1;
-  int cx;
-  int cy;
-  int hx;
-  int hy;
-  uint16_t boxColor;
-} OverlayScreen;
-
 typedef enum {
   BODY_UNKNOWN = 0,
   BODY_UPPER,
@@ -139,6 +124,31 @@ typedef struct {
   int bw;
   int bh;
 } BodyClassResult;
+
+typedef struct {
+  bool valid;
+  int headX;
+  int headY;
+  int leftShoulderX;
+  int leftShoulderY;
+  int rightShoulderX;
+  int rightShoulderY;
+  int torsoX;
+  int torsoY;
+} UpperBodyKeypoints;
+
+typedef struct {
+  bool valid;
+  int boxX0;
+  int boxY0;
+  int boxX1;
+  int boxY1;
+  int cx;
+  int cy;
+  int hx;
+  int hy;
+  uint16_t boxColor;
+} OverlayScreen;
 
 // =====================================================
 // 유틸
@@ -244,7 +254,7 @@ void estimateAdaptiveRange(float &tMin, float &tMax) {
 }
 
 // =====================================================
-// 표시 창 계산
+// 표시 영역 계산
 // =====================================================
 void calcDisplayWindow(int &drawX, int &drawY, int &drawW, int &drawH) {
 #if KEEP_ASPECT_RATIO
@@ -277,7 +287,7 @@ void clearMargins(int drawX, int drawY, int drawW, int drawH) {
 }
 
 // =====================================================
-// threshold mask 생성
+// threshold mask
 // =====================================================
 float buildThresholdMask(float tMin, float tMax) {
   float thresholdTemp;
@@ -306,7 +316,8 @@ void erodeMask(const uint8_t src[SRC_H][SRC_W], uint8_t dst[SRC_H][SRC_W], int r
       uint8_t keep = 1;
       for (int ky = -radius; ky <= radius && keep; ky++) {
         for (int kx = -radius; kx <= radius; kx++) {
-          int nx = x + kx, ny = y + ky;
+          int nx = x + kx;
+          int ny = y + ky;
           if (nx < 0 || nx >= SRC_W || ny < 0 || ny >= SRC_H || src[ny][nx] == 0) {
             keep = 0;
             break;
@@ -324,7 +335,8 @@ void dilateMask(const uint8_t src[SRC_H][SRC_W], uint8_t dst[SRC_H][SRC_W], int 
       uint8_t on = 0;
       for (int ky = -radius; ky <= radius && !on; ky++) {
         for (int kx = -radius; kx <= radius; kx++) {
-          int nx = x + kx, ny = y + ky;
+          int nx = x + kx;
+          int ny = y + ky;
           if (nx < 0 || nx >= SRC_W || ny < 0 || ny >= SRC_H) continue;
           if (src[ny][nx]) {
             on = 1;
@@ -436,7 +448,7 @@ DetectionResult floodFillBlob(int startX, int startY, float thresholdTemp, float
 }
 
 // =====================================================
-// 가장 큰 blob 선택
+// largest blob
 // =====================================================
 DetectionResult detectLargestBlob(float tMin, float tMax) {
   float thresholdTemp = buildThresholdMask(tMin, tMax);
@@ -478,7 +490,7 @@ DetectionResult detectLargestBlob(float tMin, float tMax) {
 }
 
 // =====================================================
-// 얼굴만 잡힐 때 상체 박스로 1차 확장
+// box 확장
 // =====================================================
 void expandBoxForUpperBody(DetectionResult &r) {
   if (!r.valid) return;
@@ -502,18 +514,12 @@ void expandBoxForUpperBody(DetectionResult &r) {
   }
 }
 
-// =====================================================
-// 열원(얼굴) 기준 torso 추가 확장
-// hottest point 아래쪽 warm region을 찾아 박스 확장
-// =====================================================
 void expandTorsoFromHotRegion(DetectionResult &r) {
 #if ENABLE_HOT_TORSO_EXPAND
   if (!r.valid) return;
 
   float torsoTempThr = r.hotTemp - HOT_EXPAND_TEMP_MARGIN;
-  if (torsoTempThr < HOT_EXPAND_MIN_TEMP) {
-    torsoTempThr = HOT_EXPAND_MIN_TEMP;
-  }
+  if (torsoTempThr < HOT_EXPAND_MIN_TEMP) torsoTempThr = HOT_EXPAND_MIN_TEMP;
 
   int xStart = clampi(r.hotX - HOT_EXPAND_SIDE_CELLS, 0, SRC_W - 1);
   int xEnd   = clampi(r.hotX + HOT_EXPAND_SIDE_CELLS, 0, SRC_W - 1);
@@ -525,8 +531,7 @@ void expandTorsoFromHotRegion(DetectionResult &r) {
   int addMaxX = 0;
   int addMaxY = 0;
   int addCount = 0;
-  long sumX = 0;
-  long sumY = 0;
+  long sumX = 0, sumY = 0;
 
   for (int y = yStart; y <= yEnd; y++) {
     for (int x = xStart; x <= xEnd; x++) {
@@ -549,7 +554,6 @@ void expandTorsoFromHotRegion(DetectionResult &r) {
     if (addMaxX > r.maxX) r.maxX = addMaxX;
     if (addMaxY > r.maxY) r.maxY = addMaxY;
 
-    // 중심은 기존 box 중심보다 torso 쪽을 조금 반영
     float torsoCx = (float)sumX / (float)addCount;
     float torsoCy = (float)sumY / (float)addCount;
     r.cx = 0.35f * r.cx + 0.65f * torsoCx;
@@ -559,7 +563,7 @@ void expandTorsoFromHotRegion(DetectionResult &r) {
 }
 
 // =====================================================
-// 상체 / 전신 분류
+// body classification
 // =====================================================
 BodyClassResult classifyBodyType(const DetectionResult &r) {
   BodyClassResult c;
@@ -581,26 +585,92 @@ BodyClassResult classifyBodyType(const DetectionResult &r) {
   c.bottomRatio = (float)r.maxY / (float)(SRC_H - 1);
   c.hotTopRatio = (float)r.hotY / (float)(SRC_H - 1);
 
-  // 전신: 세로로 길고, 하단이 충분히 내려옴
   if (c.aspect >= 1.20f && c.bottomRatio >= 0.88f) {
     c.type = BODY_FULL;
     return c;
   }
 
-  // 상체: 하단이 충분히 안 내려오거나 세로/가로 비가 낮음
   if (c.aspect < 1.20f || c.bottomRatio < 0.84f) {
     c.type = BODY_UPPER;
     return c;
   }
 
-  // 열원이 상단에 몰리고 하단이 끝까지 안 가면 상체
   if (c.hotTopRatio < 0.45f && c.bottomRatio < 0.90f) {
     c.type = BODY_UPPER;
     return c;
   }
 
-  c.type = BODY_UNKNOWN;
   return c;
+}
+
+// =====================================================
+// upper-body keypoints
+// =====================================================
+UpperBodyKeypoints estimateUpperBodyKeypoints(const DetectionResult &r) {
+  UpperBodyKeypoints k;
+  k.valid = false;
+  k.headX = k.headY = 0;
+  k.leftShoulderX = k.leftShoulderY = 0;
+  k.rightShoulderX = k.rightShoulderY = 0;
+  k.torsoX = k.torsoY = 0;
+
+  if (!r.valid) return k;
+
+  // 1) head = hottest point
+  k.headX = r.hotX;
+  k.headY = r.hotY;
+
+  // 2) shoulder row 탐색
+  int searchYStart = clampi(r.hotY + 1, r.minY, r.maxY);
+  int searchYEnd   = clampi(r.hotY + 8, r.minY, r.maxY);
+
+  int bestY = -1;
+  int bestMinX = 0;
+  int bestMaxX = 0;
+  int bestWidth = -1;
+
+  for (int y = searchYStart; y <= searchYEnd; y++) {
+    int rowMinX = SRC_W - 1;
+    int rowMaxX = -1;
+
+    for (int x = r.minX; x <= r.maxX; x++) {
+      float temp = smoothFrame[y][x];
+      if (temp >= (r.thresholdTemp - 0.8f)) {
+        if (x < rowMinX) rowMinX = x;
+        if (x > rowMaxX) rowMaxX = x;
+      }
+    }
+
+    if (rowMaxX >= rowMinX) {
+      int width = rowMaxX - rowMinX + 1;
+      if (width > bestWidth) {
+        bestWidth = width;
+        bestY = y;
+        bestMinX = rowMinX;
+        bestMaxX = rowMaxX;
+      }
+    }
+  }
+
+  if (bestY < 0) {
+    // fallback
+    bestY = clampi(r.hotY + 3, r.minY, r.maxY);
+    bestMinX = r.minX;
+    bestMaxX = r.maxX;
+  }
+
+  k.leftShoulderX = bestMinX;
+  k.leftShoulderY = bestY;
+  k.rightShoulderX = bestMaxX;
+  k.rightShoulderY = bestY;
+
+  // 3) torso center
+  k.torsoX = (k.leftShoulderX + k.rightShoulderX) / 2;
+  k.torsoY = bestY + (int)((r.maxY - bestY) * 0.40f + 0.5f);
+  if (k.torsoY > r.maxY) k.torsoY = r.maxY;
+
+  k.valid = true;
+  return k;
 }
 
 // =====================================================
@@ -645,76 +715,157 @@ OverlayScreen makeOverlayScreen(const DetectionResult &r, const BodyClassResult 
 }
 
 // =====================================================
-// lineBuf 위에 overlay 직접 그리기
+// line draw helper on buffer
 // =====================================================
-void applyOverlayToLine(uint16_t *buf, int screenY, int width, const OverlayScreen &o) {
-  if (!o.valid) return;
+void drawBufferPixel(uint16_t *buf, int width, int x, uint16_t color) {
+  if (x >= 0 && x < width) buf[x] = color;
+}
 
-  // 1) bounding box
-  if (screenY == o.boxY0 || screenY == o.boxY1) {
-    int x0 = clampi(o.boxX0, 0, width - 1);
-    int x1 = clampi(o.boxX1, 0, width - 1);
-    if (x1 < x0) {
-      int t = x0; x0 = x1; x1 = t;
+void drawHorizontalMark(uint16_t *buf, int width, int centerX, int radius, uint16_t color) {
+  for (int dx = -radius; dx <= radius; dx++) {
+    int x = centerX + dx;
+    if (x >= 0 && x < width) buf[x] = color;
+  }
+}
+
+// 간단한 선 raster: 현재 line(screenY)에 교차하는 x만 칠함
+void drawSegmentOnLine(uint16_t *buf, int width, int screenY,
+                       int x0, int y0, int x1, int y1,
+                       uint16_t color, int thickness) {
+  if (y0 == y1) {
+    if (abs(screenY - y0) <= thickness / 2) {
+      int xa = x0;
+      int xb = x1;
+      if (xb < xa) { int t = xa; xa = xb; xb = t; }
+      xa = clampi(xa, 0, width - 1);
+      xb = clampi(xb, 0, width - 1);
+      for (int x = xa; x <= xb; x++) buf[x] = color;
     }
-    for (int x = x0; x <= x1; x++) {
-      buf[x] = o.boxColor;
-    }
+    return;
   }
 
-  if (screenY >= o.boxY0 && screenY <= o.boxY1) {
-    if (o.boxX0 >= 0 && o.boxX0 < width) buf[o.boxX0] = o.boxColor;
-    if (o.boxX1 >= 0 && o.boxX1 < width) buf[o.boxX1] = o.boxColor;
-    if (o.boxX0 + 1 >= 0 && o.boxX0 + 1 < width) buf[o.boxX0 + 1] = o.boxColor;
-    if (o.boxX1 - 1 >= 0 && o.boxX1 - 1 < width) buf[o.boxX1 - 1] = o.boxColor;
-  }
+  int minY = (y0 < y1) ? y0 : y1;
+  int maxY = (y0 > y1) ? y0 : y1;
+  if (screenY < minY - thickness || screenY > maxY + thickness) return;
 
-  // 2) center
-  if (screenY == o.cy || screenY == o.cy - 1 || screenY == o.cy + 1) {
-    for (int dx = -6; dx <= 6; dx++) {
-      int x = o.cx + dx;
-      if (x >= 0 && x < width) buf[x] = COLOR_GREEN;
-    }
-  }
+  float t = (float)(screenY - y0) / (float)(y1 - y0);
+  if (t < 0.0f || t > 1.0f) return;
 
-  if (screenY >= o.cy - 6 && screenY <= o.cy + 6) {
-    if (o.cx >= 0 && o.cx < width) buf[o.cx] = COLOR_GREEN;
-    if (o.cx - 1 >= 0 && o.cx - 1 < width) buf[o.cx - 1] = COLOR_GREEN;
-    if (o.cx + 1 >= 0 && o.cx + 1 < width) buf[o.cx + 1] = COLOR_GREEN;
-  }
-
-  // 3) hot point
-  for (int dx = -5; dx <= 5; dx++) {
-    int x1 = o.hx + dx;
-    int y1 = o.hy + dx;
-    int x2 = o.hx + dx;
-    int y2 = o.hy - dx;
-
-    if (screenY == y1 && x1 >= 0 && x1 < width) buf[x1] = COLOR_RED;
-    if (screenY == y2 && x2 >= 0 && x2 < width) buf[x2] = COLOR_RED;
-  }
-
-  if (screenY == o.hy || screenY == o.hy - 1 || screenY == o.hy + 1) {
-    for (int dx = -4; dx <= 4; dx++) {
-      int x = o.hx + dx;
-      if (x >= 0 && x < width) buf[x] = COLOR_RED;
-    }
-  }
-
-  if (screenY >= o.hy - 4 && screenY <= o.hy + 4) {
-    if (o.hx >= 0 && o.hx < width) buf[o.hx] = COLOR_RED;
+  int x = (int)(x0 + (x1 - x0) * t + 0.5f);
+  for (int dx = -thickness / 2; dx <= thickness / 2; dx++) {
+    drawBufferPixel(buf, width, x + dx, color);
   }
 }
 
 // =====================================================
-// heatmap + overlay 스트리밍 출력
+// overlay buffer draw
 // =====================================================
-void drawHeatmapStreamingWithOverlay(float tMin, float tMax, const DetectionResult &det, const BodyClassResult &cls) {
+void applyOverlayToLine(uint16_t *buf, int screenY, int width,
+                        const OverlayScreen &o,
+                        const UpperBodyKeypoints &k) {
+  if (o.valid) {
+    // box
+    if (screenY == o.boxY0 || screenY == o.boxY1) {
+      int x0 = clampi(o.boxX0, 0, width - 1);
+      int x1 = clampi(o.boxX1, 0, width - 1);
+      if (x1 < x0) { int t = x0; x0 = x1; x1 = t; }
+      for (int x = x0; x <= x1; x++) buf[x] = o.boxColor;
+    }
+
+    if (screenY >= o.boxY0 && screenY <= o.boxY1) {
+      drawBufferPixel(buf, width, o.boxX0, o.boxColor);
+      drawBufferPixel(buf, width, o.boxX1, o.boxColor);
+      drawBufferPixel(buf, width, o.boxX0 + 1, o.boxColor);
+      drawBufferPixel(buf, width, o.boxX1 - 1, o.boxColor);
+    }
+
+    // center
+    if (screenY == o.cy || screenY == o.cy - 1 || screenY == o.cy + 1) {
+      drawHorizontalMark(buf, width, o.cx, 6, COLOR_GREEN);
+    }
+    if (screenY >= o.cy - 6 && screenY <= o.cy + 6) {
+      drawBufferPixel(buf, width, o.cx, COLOR_GREEN);
+      drawBufferPixel(buf, width, o.cx - 1, COLOR_GREEN);
+      drawBufferPixel(buf, width, o.cx + 1, COLOR_GREEN);
+    }
+
+    // hot point
+    for (int dx = -5; dx <= 5; dx++) {
+      int x1 = o.hx + dx;
+      int y1 = o.hy + dx;
+      int x2 = o.hx + dx;
+      int y2 = o.hy - dx;
+      if (screenY == y1) drawBufferPixel(buf, width, x1, COLOR_RED);
+      if (screenY == y2) drawBufferPixel(buf, width, x2, COLOR_RED);
+    }
+    if (screenY == o.hy || screenY == o.hy - 1 || screenY == o.hy + 1) {
+      drawHorizontalMark(buf, width, o.hx, 4, COLOR_RED);
+    }
+    if (screenY >= o.hy - 4 && screenY <= o.hy + 4) {
+      drawBufferPixel(buf, width, o.hx, COLOR_RED);
+    }
+  }
+
+  // keypoints
+  if (k.valid) {
+    int hx = k.headX;
+    int hy = k.headY;
+    int lsx = k.leftShoulderX;
+    int lsy = k.leftShoulderY;
+    int rsx = k.rightShoulderX;
+    int rsy = k.rightShoulderY;
+    int tx = k.torsoX;
+    int ty = k.torsoY;
+
+    // 연결선
+    drawSegmentOnLine(buf, width, screenY, lsx, lsy, rsx, rsy, COLOR_CYAN, 2);
+    drawSegmentOnLine(buf, width, screenY, hx, hy, tx, ty, COLOR_MAGENTA, 2);
+    drawSegmentOnLine(buf, width, screenY, ((lsx + rsx) / 2), lsy, tx, ty, COLOR_BLUE, 2);
+
+    // head 점
+    if (screenY >= hy - 2 && screenY <= hy + 2) {
+      drawHorizontalMark(buf, width, hx, 2, COLOR_RED);
+    }
+
+    // shoulders 점
+    if (screenY >= lsy - 2 && screenY <= lsy + 2) {
+      drawHorizontalMark(buf, width, lsx, 2, COLOR_BLUE);
+    }
+    if (screenY >= rsy - 2 && screenY <= rsy + 2) {
+      drawHorizontalMark(buf, width, rsx, 2, COLOR_BLUE);
+    }
+
+    // torso 점
+    if (screenY >= ty - 2 && screenY <= ty + 2) {
+      drawHorizontalMark(buf, width, tx, 2, COLOR_GREEN);
+    }
+  }
+}
+
+// =====================================================
+// heatmap + overlay draw
+// =====================================================
+void drawHeatmapStreamingWithOverlay(float tMin, float tMax,
+                                     const DetectionResult &det,
+                                     const BodyClassResult &cls,
+                                     const UpperBodyKeypoints &kp) {
   int drawX, drawY, drawW, drawH;
   calcDisplayWindow(drawX, drawY, drawW, drawH);
   clearMargins(drawX, drawY, drawW, drawH);
 
   OverlayScreen ov = makeOverlayScreen(det, cls);
+
+  UpperBodyKeypoints localK = kp;
+  if (localK.valid) {
+    localK.headX = mapSrcXToScreen(localK.headX) - drawX;
+    localK.headY = mapSrcYToScreen(localK.headY);
+    localK.leftShoulderX = mapSrcXToScreen(localK.leftShoulderX) - drawX;
+    localK.leftShoulderY = mapSrcYToScreen(localK.leftShoulderY);
+    localK.rightShoulderX = mapSrcXToScreen(localK.rightShoulderX) - drawX;
+    localK.rightShoulderY = mapSrcYToScreen(localK.rightShoulderY);
+    localK.torsoX = mapSrcXToScreen(localK.torsoX) - drawX;
+    localK.torsoY = mapSrcYToScreen(localK.torsoY);
+  }
 
   for (int dy = 0; dy < drawH; dy++) {
     int screenY = drawY + dy;
@@ -744,14 +895,15 @@ void drawHeatmapStreamingWithOverlay(float tMin, float tMax, const DetectionResu
       lineBuf[dx] = colorMap565((uint8_t)(n * 255.0f));
     }
 
-    if (ov.valid) {
-      OverlayScreen local = ov;
-      local.boxX0 -= drawX;
-      local.boxX1 -= drawX;
-      local.cx    -= drawX;
-      local.hx    -= drawX;
-      applyOverlayToLine(lineBuf, screenY, drawW, local);
+    OverlayScreen localO = ov;
+    if (localO.valid) {
+      localO.boxX0 -= drawX;
+      localO.boxX1 -= drawX;
+      localO.cx    -= drawX;
+      localO.hx    -= drawX;
     }
+
+    applyOverlayToLine(lineBuf, screenY, drawW, localO, localK);
 
     tft.drawBitmap(drawX, screenY, lineBuf, drawW, 1);
     if ((dy & 7) == 0) yield();
@@ -768,17 +920,14 @@ void printDetection(const DetectionResult &r) {
   if (r.valid) {
     Serial.print(" | Count=");
     Serial.print(r.count);
-
     Serial.print(" | Box=(");
     Serial.print(r.minX); Serial.print(",");
     Serial.print(r.minY); Serial.print(")-(");
     Serial.print(r.maxX); Serial.print(",");
     Serial.print(r.maxY); Serial.print(")");
-
     Serial.print(" | Center=(");
     Serial.print(r.cx, 1); Serial.print(",");
     Serial.print(r.cy, 1); Serial.print(")");
-
     Serial.print(" | Hot=(");
     Serial.print(r.hotX); Serial.print(",");
     Serial.print(r.hotY); Serial.print(")=");
@@ -802,6 +951,29 @@ void printBodyClass(const BodyClassResult &c) {
   Serial.print(c.bottomRatio, 2);
   Serial.print(" hotTop=");
   Serial.println(c.hotTopRatio, 2);
+}
+
+void printUpperBodyKeypoints(const UpperBodyKeypoints &k) {
+  if (!k.valid) {
+    Serial.println("Keypoints=INVALID");
+    return;
+  }
+
+  Serial.print("Head=(");
+  Serial.print(k.headX); Serial.print(",");
+  Serial.print(k.headY); Serial.print(") ");
+
+  Serial.print("LS=(");
+  Serial.print(k.leftShoulderX); Serial.print(",");
+  Serial.print(k.leftShoulderY); Serial.print(") ");
+
+  Serial.print("RS=(");
+  Serial.print(k.rightShoulderX); Serial.print(",");
+  Serial.print(k.rightShoulderY); Serial.print(") ");
+
+  Serial.print("Torso=(");
+  Serial.print(k.torsoX); Serial.print(",");
+  Serial.print(k.torsoY); Serial.println(")");
 }
 
 // =====================================================
@@ -833,7 +1005,7 @@ void setup() {
   tft.setOrientation(3);
   tft.clear();
 
-  Serial.println("MLX90640 upper/full body classified demo start");
+  Serial.println("MLX90640 body + keypoints demo start");
 }
 
 // =====================================================
@@ -857,19 +1029,25 @@ void loop() {
 
     DetectionResult det = detectLargestBlob(tMin, tMax);
 
-    // 1차: 얼굴만 잡히면 상체 box 확장
+    // 얼굴만 잡히는 경우 확장
     expandBoxForUpperBody(det);
 
-    // 2차: hottest point 아래 torso warm region 반영
+    // 열원 기준 torso 확장
     expandTorsoFromHotRegion(det);
 
     // 분류
     BodyClassResult cls = classifyBodyType(det);
 
-    // 출력
-    drawHeatmapStreamingWithOverlay(tMin, tMax, det, cls);
+    // 상체 keypoints
+    UpperBodyKeypoints kp = estimateUpperBodyKeypoints(det);
+
+    // 화면 출력
+    drawHeatmapStreamingWithOverlay(tMin, tMax, det, cls, kp);
+
+    // 시리얼 출력
     printDetection(det);
     printBodyClass(cls);
+    printUpperBodyKeypoints(kp);
   } else {
     Serial.println("MLX90640 frame read error");
   }
